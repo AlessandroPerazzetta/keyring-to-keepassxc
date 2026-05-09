@@ -1,17 +1,19 @@
 # keyring-to-keepassxc
 
-Export GNOME Keyring (Seahorse) credentials to a CSV file ready for import into [KeePassXC](https://keepassxc.org/).
+Export **GNOME Keyring** (Seahorse) or **KDE Wallet** (KWallet) credentials to a CSV file ready for import into [KeePassXC](https://keepassxc.org/).
 
-The script reads secrets directly from the running GNOME keyring daemon via D-Bus (using `secretstorage`), so **no password or manual decryption is required**. It optionally accepts a `.keyring` binary file to identify and filter the target collection.
+The script auto-detects the keyring in use, connects to the running daemon via D-Bus (using `secretstorage`), and exports all unlocked entries — **no password or manual decryption is required**.
 
 ## Requirements
 
-- Python 3.7+
-- [`secretstorage`](https://pypi.org/project/SecretStorage/) — D-Bus bridge to the GNOME keyring daemon
-- A running GNOME keyring daemon (standard on GNOME, Cinnamon, and most Ubuntu/Fedora desktops)
+- Python 3.10+
+- [`secretstorage`](https://pypi.org/project/SecretStorage/) — D-Bus bridge to the keyring daemon
+- A running keyring daemon:
+  - **GNOME**: `gnome-keyring-daemon` (standard on GNOME, Cinnamon, most Ubuntu/Fedora desktops)
+  - **KDE**: `kwalletd5` / `kwalletd6` with its SecretService compatibility layer enabled
 
 ```
-pip install secretstorage
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -22,24 +24,29 @@ python run.py [--keyring <file-or-label>] [--output <output.csv>]
 
 | Argument | Default | Description |
 |---|---|---|
-| `--keyring` | *(all collections)* | Path to a `.keyring` binary file **or** a plain collection label (e.g. `Login`). When a file is given, the keyring name is read from the binary header; if the file is not a valid GNOME keyring, the value is used as-is as a label. |
+| `--keyring` | *(auto-detect)* | **GNOME**: path to a `.keyring` binary file or a plain collection label (e.g. `Login`). **KDE**: path to a `.kwl` wallet binary. When omitted, the default location for each desktop is probed automatically. |
 | `--output` | `keyring_export.csv` | Path for the output CSV file. |
 
 ### Examples
 
-Export a specific keyring identified by its binary file:
+Auto-detect the current keyring and export everything:
 ```
-python run.py --keyring login.keyring --output export.csv
+python run.py --output export.csv
 ```
 
-Export a collection by label:
+Export a specific GNOME keyring binary:
+```
+python run.py --keyring ~/.local/share/keyrings/login.keyring --output export.csv
+```
+
+Export a GNOME collection by label:
 ```
 python run.py --keyring Login --output export.csv
 ```
 
-Export all unlocked collections:
+Export a KDE wallet binary:
 ```
-python run.py --output export.csv
+python run.py --keyring ~/.local/share/kwalletd/kdewallet.kwl --output export.csv
 ```
 
 ## Output format
@@ -48,21 +55,39 @@ The CSV uses KeePassXC's standard import columns:
 
 | Group | Title | Username | Password | URL | Notes |
 |---|---|---|---|---|---|
-| Imported | entry label | account / username | secret | service / host | Imported from GNOME Keyring |
+| Imported | entry label | account / username | secret | service / host | Imported from keyring |
 
 To import into KeePassXC: **Database → Import → CSV file**, then map the columns when prompted (they match KeePassXC's defaults).
 
 ## How it works
 
-1. **Identify** — if a `.keyring` file is provided, the binary header is parsed to verify the GNOME magic bytes and extract the collection name, format version, and crypto/hash types (AES + MD5 is the only supported combination).
-2. **Connect** — connects to the GNOME keyring daemon over D-Bus.
-3. **Filter** — selects the matching collection (or all unlocked collections if no filter is given).
-4. **Export** — reads each item's label, secret, and attributes (`account`, `username`, `service`, `host`, etc.) and writes them to CSV.
+The codebase is split into three layers:
 
-Locked collections are skipped with a warning.
+### `keyring_reader.py` — auto-detection dispatcher
+
+- `detect_keyring_type(path)` — reads the first bytes of a file and returns `'gnome'`, `'kde'`, or `'unknown'`.
+- `detect_default_keyring()` — probes the standard paths (`~/.local/share/keyrings/login.keyring` for GNOME, `~/.local/share/kwalletd/kdewallet.kwl` for KDE) and returns the first valid one found.
+- `read_keyring(arg)` — routes to the correct backend based on file magic, then returns a normalised `list[dict]` with keys `label`, `username`, `password`, `server`, `attributes`.
+
+### `_keyring_gnome.py` — GNOME backend
+
+1. If a `.keyring` file is given, its binary header is parsed (GNOME magic bytes + embedded collection name).
+2. Connects to the GNOME keyring daemon over D-Bus.
+3. Filters collections by label (or reads all unlocked ones).
+4. Returns normalised credential dicts.
+
+### `_keyring_kde.py` — KDE backend
+
+1. Validates the `.kwl` file magic bytes.
+2. Optionally loads a companion `{stem}_attributes.json` index to supplement item attributes not always exposed by kwalletd's SecretService layer.
+3. Connects to kwalletd over D-Bus (SecretService compatibility mode).
+4. Matches the collection by wallet name (`.kwl` stem) and returns normalised credential dicts.
+
+Locked collections are skipped with a warning in both backends.
 
 ## Notes
 
-- The script does **not** decrypt the `.keyring` file itself — it talks to the daemon, which handles decryption after the session is unlocked.
-- Secrets are stripped of trailing null bytes (`\x00`) that GNOME keyring appends to some entries.
+- The script does **not** decrypt keyring files directly — it talks to the daemon, which handles decryption after the session is unlocked.
+- Secrets are stripped of trailing null bytes (`\x00`) that some keyring implementations append.
 - The exported CSV contains **plaintext passwords** — handle it accordingly and delete it after importing.
+- KDE: `kwalletd` must have the *SecretService* interface enabled (`System Settings → KWallet → Enable the KDE Wallet subsystem → Also expose via SecretService`).

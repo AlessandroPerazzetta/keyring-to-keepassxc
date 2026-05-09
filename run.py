@@ -1,71 +1,43 @@
 import csv
 import argparse
-import struct
-import secretstorage
 
-GNOME_KEYRING_MAGIC = b"GnomeKeyring\n\r\x00\n"
-
-CRYPTO_TYPES = {0: "AES"}
-HASH_TYPES = {0: "MD5"}
-
-
-def identify_keyring(path):
-    """Read a .keyring binary file and return its metadata, or None if not recognised."""
-    try:
-        with open(path, "rb") as fh:
-            data = fh.read()
-    except OSError as exc:
-        return None, f"Cannot read file: {exc}"
-
-    if data[:16] != GNOME_KEYRING_MAGIC:
-        return None, "Not a GNOME keyring file (magic mismatch)"
-
-    if len(data) < 29:  # magic(16) + 4 flag bytes + name_len(4) + at least 1 char
-        return None, "File too short to be a valid GNOME keyring"
-
-    major = data[16]
-    minor = data[17]
-    crypto_type = data[18]
-    hash_type = data[19]
-
-    name_len = struct.unpack_from(">I", data, 20)[0]
-    if 24 + name_len > len(data):
-        return None, "Corrupt keyring: name length exceeds file size"
-
-    name = data[24 : 24 + name_len].decode("utf-8", errors="replace")
-
-    info = {
-        "name": name,
-        "version": f"{major}.{minor}",
-        "crypto": CRYPTO_TYPES.get(crypto_type, f"unknown({crypto_type})"),
-        "hash": HASH_TYPES.get(hash_type, f"unknown({hash_type})"),
-    }
-    return info, None
+from keyring_reader import detect_default_keyring, detect_keyring_type, read_keyring
+from pathlib import Path
 
 
 def main():
+    # Auto-detect default keyring for the help text and startup message.
+    default_path, default_kind = detect_default_keyring()
+    default_hint = (
+        f"{default_path} ({default_kind})" if default_path else "not detected"
+    )
+
     parser = argparse.ArgumentParser(
         description=(
-            "Export GNOME Keyring (Seahorse) credentials to a CSV file ready for\n"
-            "import into KeePassXC (Database → Import → CSV file).\n\n"
-            "The script connects to the running GNOME keyring daemon via D-Bus, so\n"
-            "no password or manual decryption is needed — the daemon handles that\n"
-            "after your session is unlocked."
+            "Export GNOME Keyring (Seahorse) or KDE Wallet (KWallet) credentials\n"
+            "to a CSV file ready for import into KeePassXC\n"
+            "(Database → Import → CSV file).\n\n"
+            "The script connects to the running keyring daemon via D-Bus, so no\n"
+            "password or manual decryption is needed — the daemon handles that\n"
+            "after your session is unlocked.\n\n"
+            f"Auto-detected keyring: {default_hint}"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  # export a specific keyring by its binary file\n"
-            "  python run.py --keyring login.keyring --output export.csv\n\n"
-            "  # export a collection by label (case-insensitive)\n"
-            "  python run.py --keyring Login --output export.csv\n\n"
-            "  # export all unlocked collections\n"
+            "  # auto-detect and export all unlocked collections\n"
             "  python run.py --output export.csv\n\n"
+            "  # export a specific GNOME keyring binary\n"
+            "  python run.py --keyring ~/.local/share/keyrings/login.keyring --output export.csv\n\n"
+            "  # export a GNOME collection by label\n"
+            "  python run.py --keyring Login --output export.csv\n\n"
+            "  # export a KDE wallet binary\n"
+            "  python run.py --keyring ~/.local/share/kwalletd/kdewallet.kwl --output export.csv\n\n"
             "notes:\n"
             "  - Locked collections are skipped with a warning.\n"
             "  - The output CSV contains plaintext passwords; delete it after importing.\n"
-            "  - To see available collection labels, run without --keyring (a warning\n"
-            "    lists them if none match) or open 'Passwords and Keys' (seahorse).\n"
+            "  - For GNOME: pass a .keyring file path or a plain collection label.\n"
+            "  - For KDE: pass a .kwl file path; kwalletd must be running.\n"
         ),
     )
     parser.add_argument(
@@ -73,11 +45,12 @@ def main():
         metavar="FILE_OR_LABEL",
         default=None,
         help=(
-            "Path to a GNOME .keyring binary file (e.g. login.keyring) OR a plain\n"
-            "collection label (e.g. 'Login'). When a file is given, its binary header\n"
-            "is parsed to verify it is a valid GNOME keyring and the collection name\n"
-            "is extracted from it. If no value is given, all unlocked collections are\n"
-            "exported."
+            "GNOME: path to a .keyring binary or a plain collection label "
+            "(e.g. 'Login'). "
+            "KDE: path to a .kwl wallet binary "
+            "(e.g. ~/.local/share/kwalletd/kdewallet.kwl). "
+            "When omitted the keyring type is auto-detected from the default "
+            "locations and all unlocked entries are exported."
         ),
     )
     parser.add_argument(
@@ -88,70 +61,51 @@ def main():
     )
     args = parser.parse_args()
 
-    label_filter = None
+    # Report what we are reading.
     if args.keyring:
-        info, error = identify_keyring(args.keyring)
-        if error:
-            # Not a file path – treat the argument as a plain collection label
-            label_filter = args.keyring
-            print(f"Using '{label_filter}' as collection label ({error})")
+        p = Path(args.keyring)
+        if p.is_dir():
+            print(f"Scanning directory for keyring files: {p}")
+        elif p.is_file():
+            ktype = detect_keyring_type(p)
+            kind_label = ktype.upper() if ktype != "unknown" else "unknown"
+            print(f"Reading keyring: {p} (detected: {kind_label})")
         else:
-            label_filter = info["name"]
-            print(
-                f"Identified GNOME keyring: '{info['name']}' "
-                f"(version {info['version']}, crypto={info['crypto']}, hash={info['hash']})"
-            )
-
-    conn = secretstorage.dbus_init()
-    all_collections = list(secretstorage.get_all_collections(conn))
-
-    if label_filter:
-        collections = [
-            c for c in all_collections
-            if c.get_label().lower() == label_filter.lower()
-        ]
-        if not collections:
-            labels = [c.get_label() for c in all_collections]
-            print(f"No collection matching '{label_filter}'. Available: {labels}")
-            return
+            print(f"Using '{args.keyring}' as GNOME collection label")
     else:
-        collections = all_collections
-
-    entries = []
-    for collection in collections:
-        if collection.is_locked():
-            print(f"Skipping locked collection: '{collection.get_label()}'")
-            continue
-
-        for item in collection.get_all_items():
-            label = item.get_label() or ""
-            raw_secret = item.get_secret()
-            secret = raw_secret.decode("utf-8", errors="replace").rstrip("\x00") if raw_secret else ""
-            attrs = item.get_attributes()
-
-            username = (
-                attrs.get("account")
-                or attrs.get("username")
-                or attrs.get("user")
-                or ""
-            )
-            service = (
-                attrs.get("service")
-                or attrs.get("server")
-                or attrs.get("host")
-                or ""
+        if default_path:
+            print(f"Auto-detected {default_kind} keyring: {default_path}")
+        else:
+            print(
+                "Warning: no default keyring found at the standard locations.\n"
+                "Pass --keyring to specify a file or collection label explicitly."
             )
 
-            entries.append(
-                ["Imported", label, username, secret, service, "Imported from GNOME Keyring"]
-            )
+    try:
+        entries = read_keyring(args.keyring or "")
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        return
 
-    with open(args.output, "w", newline="") as f:
+    rows = []
+    for entry in entries:
+        rows.append(
+            [
+                "Imported",
+                entry["label"],
+                entry["username"],
+                entry["password"],
+                entry["server"],
+                "Imported from keyring",
+            ]
+        )
+
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
         writer.writerow(["Group", "Title", "Username", "Password", "URL", "Notes"])
-        writer.writerows(entries)
+        writer.writerows(rows)
 
-    print(f"Exported {len(entries)} entries to '{args.output}'")
+    print(f"Exported {len(rows)} entries to '{args.output}'")
 
 
 if __name__ == "__main__":
